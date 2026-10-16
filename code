@@ -1,0 +1,1328 @@
+// crl-http.js — CRL-Signaturprüfung (RFC 5280), OCSP (RFC 6960), Widerrufsprüfung
+// nach Wert und die gehärtete HTTP-Schicht dafür — in einem Modul.
+//
+// Teil 1 (Prüfung):    Darf man dieser CRL glauben, und steht die Seriennummer drin?
+// Teil 2 (Transport):  Darf man die URL überhaupt abrufen, die im Zertifikat steht?
+// Teil 3 (Verdrahtung): createCrlChecker() — mit eingebauter Politik und Cache.
+// Teil 4 (Persistenz): createCrlState()/jsonFileState()/createPersistentChecker()
+//                      — der Replay-Schutz überlebt Prozess-Neustarts.
+// Teil 5 (Zertifikat): parseCert()/createCertificateChecker() — vom Zertifikat
+//                      zur Entscheidung.
+// Teil 6 (OCSP):       createOcspRequest()/verifyOcsp()/createOcspChecker() —
+//                      RFC 6960, im selben Stil: fail-closed, strenge DER-Sicht.
+//
+// Ergebnis von verifyCrl/verifyOcsp: { ok, outcome, step, reason?, …? }
+//   outcome "verified"  nur wenn jede Prüfung gehalten hat
+//   outcome "invalid"   die Signatur hält nicht (eine Aussage über die Antwort)
+//   outcome "unknown"   nicht prüfbar: Format, Algorithmus, Schlüssel, Frist,
+//                       Responder, Nonce, Umfang, Krypto-Ausnahme, Wiedergabe
+// `unknown` und `invalid` bleiben verschiedene Aussagen.
+//
+// Geprüft wird der Reihe nach — CRL:
+//   parse → issuer-name → key → algorithm → signature → replay → freshness → verified
+// OCSP:
+//   parse → responder → signature → nonce → cert-id → freshness → status
+// Fristen werden erst NACH der Signatur geprüft: nur verifizierte Daten zählen.
+//
+// POLITIK IST EINGEBAUT, NICHT DELEGIERT. Jedes Ergebnis trägt `decision`,
+// und der sichere Weg ist der Default:
+//   policy "closed" (Standard): nur ein verifiziertes, frisches "good" → allow.
+//   policy "open":  zusätzlich "unknown" → allow (Verfügbarkeit vor Strenge).
+//   "invalid" (gefälscht — Angriffssignal), "expired" (außerhalb der Gültigkeit)
+//   und "unchecked" (nie geprüft) bleiben in BEIDEN Politiken deny.
+//
+// EFFIZIENZ IST EINGEBAUT. createCrlChecker hält verifizierte CRLs bis
+// nextUpdate im Cache (Default: an, cache:false zum Abschalten). OCSP-Antworten
+// werden nicht gecacht — ihre Frische (nextUpdate) gilt pro Antwort, und eine
+// frische Nonce macht Wiederholung ohnehin sinnlos.
+//
+// DER wird streng gelesen: nicht-minimale Längen, BER-Booleans, nicht-minimale
+// oder negative INTEGERs, reasonCode ohne ENUMERATED → step "parse".
+//
+// OCSP-GRENZEN (bewusst, fail-closed): Responder-Authentifizierung heißt hier —
+// signiert die CA selbst (responderID byName/byKey passt zur CA) oder ein
+// delegiertes Zertifikat, das (a) von der CA signiert, (b) mit OCSP-Signing-
+// EKU versehen und (c) zum responderID passend ist, plus Gültigkeitsfenster.
+// Keine volle Zertifikatsvalidierung des Responders (kein Kettenpfad, keine
+// Widerrufsprüfung — id-pkix-ocsp-nocheck-Konvention). CertID läuft über
+// SHA-1 (RFC-üblich, hashAlg: "SHA-256" als Option). Eine angefragte Nonce
+// MUSS zurückkommen — Responders ohne Nonce-Echo fallen auf "unknown". Das
+// Responder-Zertifikat wird auf Widerruf NICHT geprüft.
+// ZERTIFIKAT-GRENZE: parseCert prüft das Zertifikat NICHT kryptografisch —
+// Kettenvalidierung ist Aufgabe des Aufrufers. parseCert liest nur Felder.
+//
+// Transport-Vertrag: http({ method, url, headers, body }) wirft nie. Es liefert
+//   { ok: true,  status, headers, body: Uint8Array, url }
+//   { ok: false, step, reason, status? }
+// `step` nennt, woran es scheiterte:
+//   url | protocol | host | redirect | timeout | size | status | network
+// (Das Rate-Limit reiht Anfragen und lehnt nie ab — daher gibt es keinen
+// step "rate".)
+//
+// URLs in Zertifikaten (CRL-, OCSP-, TSA-Endpunkte) sind Angreifer-Eingaben.
+// Deshalb: nur http(s), keine Zugangsdaten, keine privaten/lokalen Hosts
+// (auch nicht über Weiterleitungen), Größenlimit, Frist, Rate-Limit pro Host.
+// Die Frist (timeoutMs) ist eine GESAMTFrist pro Anfrage über alle Hops.
+//
+// GRENZE: Der Host-Filter prüft Literale und Namensmuster. Ein öffentlicher
+// Name, der per DNS auf eine private Adresse zeigt, wird hier NICHT erkannt.
+// Dagegen hilft nur ein Egress-Filter im Netz oder ein fetchImpl, der die
+// aufgelöste Adresse prüft. Das ist eine Eigenschaft der Umgebung, nicht des Codes.
+//
+// IP-Literale in fremder Schreibweise (Oktal "0177.0.0.1", Hex "0x7f.0.0.1",
+// Kurzformen "127.1", Dezimal "2130706433") werden abgelehnt: Resolver deuten
+// sie anders als der nackte Zahlenwert, das kann loopback/private Adressen
+// erreichbar machen.
+//
+// PERSISTENZ-GRENZEN: createCrlState hält den letzten Stand im Speicher und
+// schreibt entprellt; ein Crash kann bis zu debounceMs an Fortschritt verlieren —
+// der Verlust macht den Schutz KONSERVATIV, nie unsicherer. Mehrere Prozesse auf
+// demselben Speicher: last-writer-wins; für verteilte Instanzen einen echten
+// Store (DB mit CAS) als load/save-Schicht hinten anstellen. Ein beschädigter
+// Zustand wird beim Laden LAUT abgelehnt, nie still geleert.
+
+const subtle = () => globalThis.crypto.subtle;
+
+// =========================================================== TEIL 1: CRL ====
+
+class Refusal extends Error {
+  constructor(step, reason) { super(reason); this.step = step; }
+}
+const fail = (step, reason) => { throw new Refusal(step, reason); };
+
+// ---------------------------------------------------------------- DER -------
+function tlv(buf, off, end = buf.length) {
+  if (off + 2 > end) fail("parse", "abgeschnittener DER-Kopf");
+  const tag = buf[off];
+  if ((tag & 0x1f) === 0x1f) fail("parse", "Tags mit mehreren Bytes werden nicht unterstützt");
+  let len = buf[off + 1], p = off + 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    if (n === 0 || n > 4) fail("parse", "ungültige Längenangabe");
+    if (p + n > end) fail("parse", "abgeschnittene Länge");
+    if (buf[p] === 0) fail("parse", "nicht-minimale Länge");
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[p++];
+    const min = n === 1 ? 128 : 256 ** (n - 1);
+    if (len < min) fail("parse", "nicht-minimale Länge");
+  }
+  if (p + len > end) fail("parse", "Länge überschreitet den Puffer");
+  return { tag, hdr: off, start: p, end: p + len };
+}
+function kids(buf, n) {
+  const out = [];
+  let o = n.start;
+  while (o < n.end) { const c = tlv(buf, o, n.end); out.push(c); o = c.end; }
+  return out;
+}
+const full = (buf, n) => buf.subarray(n.hdr, n.end);
+const body = (buf, n) => buf.subarray(n.start, n.end);
+const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const text = (buf, n) => new TextDecoder().decode(body(buf, n));
+
+function oid(buf, n) {
+  if (n.tag !== 0x06) fail("parse", "OID erwartet");
+  const b = body(buf, n);
+  if (!b.length || b[b.length - 1] & 0x80) fail("parse", "ungültige OID");
+  if (b[0] & 0x80) fail("parse", "mehrbyteiges erstes Subidentifier wird nicht unterstützt");
+  const first = Math.min(2, Math.floor(b[0] / 40));
+  const parts = [first, b[0] - 40 * first];
+  let v = 0;
+  for (let i = 1; i < b.length; i++) {
+    v = v * 128 + (b[i] & 0x7f);
+    if (!(b[i] & 0x80)) { parts.push(v); v = 0; }
+  }
+  return parts.join(".");
+}
+
+function time(buf, n) {
+  const s = String.fromCharCode(...body(buf, n));
+  let m, y;
+  if (n.tag === 0x17) {
+    m = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s);
+    if (m) { const yy = +m[1]; y = yy >= 50 ? 1900 + yy : 2000 + yy; }
+  } else if (n.tag === 0x18) {
+    m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s);
+    if (m) y = +m[1];
+  } else fail("parse", "Zeitangabe erwartet");
+  if (!m) fail("parse", "ungültiges Zeitformat");
+  const ms = Date.UTC(y, +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  const d = new Date(ms);
+  if (d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3] || d.getUTCHours() !== +m[4]) {
+    fail("parse", "ungültiges Datum");
+  }
+  return ms;
+}
+
+// STRICT DER: SERIALNUMBER ist positiv; das Vorzeichen-Byte (0x00 vor High-Bit)
+// darf genau dann stehen, wenn es nötig ist.
+function intHex(buf, n) {
+  if (n.tag !== 0x02) fail("parse", "INTEGER erwartet");
+  const raw = body(buf, n);
+  if (!raw.length) fail("parse", "leerer INTEGER");
+  let z = 0;
+  while (z < raw.length - 1 && raw[z] === 0) z++;
+  if (z > 1 || (z === 1 && raw[1] < 0x80)) fail("parse", "nicht-minimaler INTEGER");
+  if (raw[z] & 0x80) fail("parse", "negativer INTEGER");
+  return hex(raw.subarray(z));
+}
+
+function bitString(buf, n) {
+  if (n.tag !== 0x03) fail("parse", "BIT STRING erwartet");
+  const b = body(buf, n);
+  if (b.length < 1 || b[0] !== 0) fail("parse", "BIT STRING mit ungenutzten Bits");
+  return b.subarray(1);
+}
+
+// DER-BOOLEAN: nur 0x00 und 0xff sind gültig; BER-Werte (z. B. 0x01) sind
+// Formatfehler, keine stillschweigend als true gelesenen Bits.
+function derBool(buf, n) {
+  const b = body(buf, n);
+  if (b.length !== 1 || (b[0] !== 0 && b[0] !== 0xff)) fail("parse", "BOOLEAN muss 0x00 oder 0xff sein");
+  return b[0] !== 0;
+}
+
+// ---------------------------------------------------------- Seriennummer ----
+// Vergleich nach Wert: führende Nullen und Groß-/Kleinschreibung zählen nicht.
+export function normalizeSerial(input) {
+  let s;
+  if (typeof input === "string") s = input.replace(/[\s:]/g, "").toLowerCase();
+  else if (input instanceof Uint8Array) s = hex(input);
+  else throw new Error("ungültige Seriennummer");
+  if (!/^[0-9a-f]*$/.test(s) || s.length === 0) throw new Error("ungültige Seriennummer");
+  s = s.replace(/^0+/, "");
+  return s === "" ? "0" : s;
+}
+
+// hex-Werte ohne führende Nullen, klein geschrieben: erst Länge, dann lexikographisch.
+const cmpHex = (a, b) => (a.length - b.length) || (a < b ? -1 : a > b ? 1 : 0);
+
+// ------------------------------------------------------------- Parser -------
+const KNOWN_CRL_EXT = new Set(["2.5.29.20", "2.5.29.35", "2.5.29.28", "2.5.29.18"]);
+
+function parseExts(buf, seq) {
+  return kids(buf, seq).map((e) => {
+    const k = kids(buf, e);
+    if (k.length < 2 || k.length > 3) fail("parse", "ungültige Erweiterung");
+    const critical = k.length === 3 ? (k[1].tag === 0x01 ? derBool(buf, k[1]) : fail("parse", "BOOLEAN erwartet")) : false;
+    const val = k[k.length - 1];
+    if (val.tag !== 0x04) fail("parse", "OCTET STRING erwartet");
+    return { oid: oid(buf, k[0]), critical, value: body(buf, val) };
+  });
+}
+
+function toDer(input) {
+  if (typeof input === "string") {
+    const m = /-----BEGIN (X509 CRL|CERTIFICATE)-----([\s\S]*?)-----END \1-----/.exec(input);
+    if (!m) fail("parse", "kein PEM-Block einer CRL oder eines Zertifikats");
+    return Uint8Array.from(atob(m[2].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+  }
+  if (!(input instanceof Uint8Array)) fail("parse", "Uint8Array oder PEM-Text erwartet");
+  const head = String.fromCharCode(...input.subarray(0, 11));
+  return head === "-----BEGIN " ? toDer(new TextDecoder().decode(input)) : input;
+}
+
+export function parseCrl(input) {
+  const der = toDer(input);
+  const root = tlv(der, 0);
+  if (root.tag !== 0x30 || root.end !== der.length) fail("parse", "keine CertificateList");
+  const top = kids(der, root);
+  if (top.length !== 3 || top[0].tag !== 0x30 || top[1].tag !== 0x30) fail("parse", "CertificateList hat falsche Gestalt");
+  const [tbs, sigAlg, sigVal] = top;
+
+  const t = kids(der, tbs);
+  const hasVersion = t[0]?.tag === 0x02;
+  let i = 0;
+  if (hasVersion) i++;
+  const tbsSig = t[i++], issuer = t[i++];
+  if (!tbsSig || !issuer || issuer.tag !== 0x30) fail("parse", "tbsCertList unvollständig");
+  if (!t[i]) fail("parse", "thisUpdate fehlt");
+  const thisUpdate = time(der, t[i++]);
+  let nextUpdate = null;
+  if (t[i] && (t[i].tag === 0x17 || t[i].tag === 0x18)) nextUpdate = time(der, t[i++]);
+
+  const revoked = [];
+  let sawEntryExts = false;
+  if (t[i]?.tag === 0x30) {
+    for (const entry of kids(der, t[i++])) {
+      const ek = kids(der, entry);
+      if (ek.length < 2 || ek.length > 3) fail("parse", "ungültiger Widerrufseintrag");
+      const serial = intHex(der, ek[0]);
+      const date = time(der, ek[1]);
+      let reason = null;
+      if (ek.length === 3) {
+        if (ek[2].tag !== 0xa0) fail("parse", "Eintrags-Erweiterungen erwarten [0]");
+        sawEntryExts = true;
+        for (const e of parseExts(der, ek[2])) {
+          if (e.oid === "2.5.29.21") {
+            const r = tlv(e.value, 0);
+            if (r.tag !== 0x0a) fail("parse", "reasonCode erwartet ENUMERATED");
+            reason = e.value[r.start];
+          }
+          else if (e.critical) fail("critical-extension", `unbekannte kritische Eintrags-Erweiterung ${e.oid}`);
+        }
+      }
+      revoked.push({ serial, date, reason });
+    }
+  }
+
+  let crlNumber = null;
+  let sawCrlExts = false;
+  const idp = { onlyContainsUserCerts: false, onlyContainsCACerts: false };
+  if (t[i]?.tag === 0xa0) {
+    sawCrlExts = true;
+    const wrap = kids(der, t[i++]);
+    if (wrap.length !== 1) fail("parse", "mehrfacher [0]-Block in tbsCertList");
+    for (const e of parseExts(der, wrap[0])) {
+      if (e.oid === "2.5.29.20") crlNumber = intHex(e.value, tlv(e.value, 0));
+      else if (e.oid === "2.5.29.28") {
+        if (!e.critical) fail("scope", "IssuingDistributionPoint ist nicht kritisch");
+        const s = tlv(e.value, 0);
+        for (const f of kids(e.value, s)) {
+          const flag = body(e.value, f)[0] !== 0;
+          if (f.tag === 0x81) idp.onlyContainsUserCerts = flag;
+          else if (f.tag === 0x82) idp.onlyContainsCACerts = flag;
+          else if (f.tag === 0xa0) fail("scope", "CRL ist auf einen Distribution Point beschränkt");
+          else if (f.tag === 0x84 && flag) fail("scope", "indirekte CRLs werden nicht unterstützt");
+          else if (f.tag === 0x83) fail("scope", "onlySomeReasons wird nicht unterstützt");
+          else if (f.tag === 0x85 && flag) fail("scope", "Attribut-Zertifikate werden nicht unterstützt");
+        }
+      } else if (e.critical && !KNOWN_CRL_EXT.has(e.oid)) {
+        fail("critical-extension", `unbekannte kritische Erweiterung ${e.oid}`);
+      }
+    }
+  }
+  if (i !== t.length) fail("parse", "unerwartete Felder in tbsCertList");
+  if ((sawCrlExts || sawEntryExts) && !hasVersion) fail("parse", "Erweiterungen verlangen CRL-Version 2");
+
+  // RFC 5280 5.1.1.2: beide Algorithmus-Angaben müssen gleich sein — hier
+  // byte-weise, absichtlich strenger als der Standard (siehe Dateikopf).
+  if (!eq(full(der, tbsSig), full(der, sigAlg))) fail("algorithm", "Algorithmus in tbsCertList und außen verschieden");
+  const sigOid = oid(der, kids(der, sigAlg)[0]);
+
+  return {
+    issuerDer: full(der, issuer), thisUpdate, nextUpdate, revoked, crlNumber, idp,
+    tbsBytes: full(der, tbs), sigAlgOid: sigOid, signature: bitString(der, sigVal),
+  };
+}
+
+// ---------------------------------------------------------- Signatur --------
+const SIG = {
+  "1.2.840.113549.1.1.11": { kind: "rsa", hash: "SHA-256" },
+  "1.2.840.113549.1.1.12": { kind: "rsa", hash: "SHA-384" },
+  "1.2.840.113549.1.1.13": { kind: "rsa", hash: "SHA-512" },
+  "1.2.840.10045.4.3.2": { kind: "ec", hash: "SHA-256" },
+  "1.2.840.10045.4.3.3": { kind: "ec", hash: "SHA-384" },
+  "1.2.840.10045.4.3.4": { kind: "ec", hash: "SHA-512" },
+  "1.3.101.112": { kind: "ed" },
+};
+const CURVES = {
+  "1.2.840.10045.3.1.7": { name: "P-256", size: 32 },
+  "1.3.132.0.34": { name: "P-384", size: 48 },
+  "1.3.132.0.35": { name: "P-521", size: 66 },
+};
+
+async function importIssuerKey(spki, alg) {
+  const root = tlv(spki, 0);
+  if (root.tag !== 0x30 || root.end !== spki.length) fail("key", "kein gültiges SubjectPublicKeyInfo");
+  const algId = kids(spki, root)[0];
+  if (!algId || algId.tag !== 0x30) fail("key", "kein gültiges SubjectPublicKeyInfo");
+  const ak = kids(spki, algId);
+  const keyOid = oid(spki, ak[0]);
+  try {
+    if (alg.kind === "rsa") {
+      if (keyOid !== "1.2.840.113549.1.1.1") fail("key", "Schlüsseltyp passt nicht zum Signaturalgorithmus");
+      return { key: await subtle().importKey("spki", spki, { name: "RSASSA-PKCS1-v1_5", hash: alg.hash }, false, ["verify"]), algorithm: { name: "RSASSA-PKCS1-v1_5" } };
+    }
+    if (alg.kind === "ec") {
+      if (keyOid !== "1.2.840.10045.2.1") fail("key", "Schlüsseltyp passt nicht zum Signaturalgorithmus");
+      const curve = ak[1] ? CURVES[oid(spki, ak[1])] : null;
+      if (!curve) fail("key", "Kurve wird nicht unterstützt");
+      return { key: await subtle().importKey("spki", spki, { name: "ECDSA", namedCurve: curve.name }, false, ["verify"]), algorithm: { name: "ECDSA", hash: { name: alg.hash } }, curve };
+    }
+    if (keyOid !== "1.3.101.112") fail("key", "Schlüsseltyp passt nicht zum Signaturalgorithmus");
+    return { key: await subtle().importKey("spki", spki, { name: "Ed25519" }, false, ["verify"]), algorithm: { name: "Ed25519" } };
+  } catch (e) {
+    if (e instanceof Refusal) throw e;
+    fail("key", "Schlüssel konnte nicht geladen werden");
+  }
+}
+
+// ECDSA-Signaturen stehen in der CRL als DER SEQUENCE{r,s}, WebCrypto will r||s.
+function ecDerToRaw(sig, size) {
+  const root = tlv(sig, 0);
+  if (root.tag !== 0x30 || root.end !== sig.length) fail("parse", "ECDSA-Signatur ist keine SEQUENCE");
+  const k = kids(sig, root);
+  if (k.length !== 2 || k[0].tag !== 0x02 || k[1].tag !== 0x02) fail("parse", "ECDSA-Signatur hat falsche Gestalt");
+  const out = new Uint8Array(size * 2);
+  [k[0], k[1]].forEach((n, idx) => {
+    let b = body(sig, n);
+    while (b.length > 1 && b[0] === 0) b = b.subarray(1);
+    if (b.length > size) fail("parse", "ECDSA-Wert zu lang für die Kurve");
+    out.set(b, idx * size + (size - b.length));
+  });
+  return out;
+}
+
+const outcomeOf = (step) => (step === "signature" ? "invalid" : "unknown");
+
+// Gemeinsame Signaturprüfung für CRL und OCSP: Algorithmus-Support, Schlüssel-
+// Import, WebCrypto-Verifikation — mit denselben Schritten wie vorher.
+async function verifyWithSpki(tbsBytes, sigAlgOid, signature, spki) {
+  const alg = SIG[sigAlgOid] ?? fail("algorithm", `Signaturalgorithmus ${sigAlgOid} wird nicht unterstützt`);
+  const k = await importIssuerKey(spki, alg);
+  const sig = alg.kind === "ec" ? ecDerToRaw(signature, k.curve.size) : signature;
+  let holds = false;
+  try { holds = await subtle().verify(k.algorithm, k.key, sig, tbsBytes); }
+  catch { fail("signature-crypto", "Signaturprüfung konnte nicht ausgeführt werden"); }
+  if (!holds) fail("signature", "Signatur hält nicht über die signierten Daten");
+  return k;
+}
+
+export async function verifyCrl(input, opts = {}) {
+  const { issuerKey, issuerName, now = Date.now(), skewSeconds = 300, requireNextUpdate = true, crlState = null } = opts;
+  try {
+    const c = parseCrl(input);
+    if (!(issuerName instanceof Uint8Array)) fail("issuer-name", "kein issuerName (DER des Subject-Namens) übergeben");
+    if (!eq(c.issuerDer, issuerName)) fail("issuer-name", "Aussteller der CRL ist nicht der Aussteller des Zertifikats");
+    if (!(issuerKey instanceof Uint8Array)) fail("key", "kein Ausstellerschlüssel (SPKI) übergeben");
+    await verifyWithSpki(c.tbsBytes, c.sigAlgOid, c.signature, issuerKey);
+
+    // Nur eine verifizierte CRL darf den gemerkten Stand ändern.
+    if (crlState) {
+      if (c.crlNumber === null) fail("replay", "CRL ohne crlNumber: Wiedergabe-Schutz nicht möglich");
+      const stateKey = hex(c.issuerDer);
+      const seen = typeof crlState.get === "function" ? crlState.get(stateKey) : crlState[stateKey];
+      if (seen !== undefined && cmpHex(c.crlNumber, seen) <= 0) {
+        fail("replay", "crlNumber nicht größer als den zuletzt gesehenen Stand");
+      }
+      if (typeof crlState.set === "function") crlState.set(stateKey, c.crlNumber);
+      else crlState[stateKey] = c.crlNumber;
+    }
+
+    const skew = skewSeconds * 1000;
+    if (c.thisUpdate > now + skew) fail("freshness", "thisUpdate liegt in der Zukunft");
+    if (c.nextUpdate === null) { if (requireNextUpdate) fail("freshness", "nextUpdate fehlt"); }
+    else if (c.nextUpdate < now - skew) fail("freshness", "CRL ist abgelaufen");
+    return { ok: true, outcome: "verified", step: "verified", crl: c };
+  } catch (e) {
+    if (e instanceof Refusal) return { ok: false, outcome: outcomeOf(e.step), step: e.step, reason: e.message };
+    return { ok: false, outcome: "unknown", step: "internal", reason: String(e?.message ?? e) };
+  }
+}
+
+// Wertsuche: Position und Schreibweise der Seriennummer spielen keine Rolle.
+export function lookupSerial(crl, serial) {
+  const s = normalizeSerial(serial);
+  const entry = crl.revoked.find((e) => e.serial === s);
+  return entry ? { revoked: true, entry } : { revoked: false };
+}
+
+// ------------------------------------------------------ Eingebaute Politik --
+// Die Konfigurationsentscheidung, die man falsch machen kann, macht das Modul
+// selbst — richtig. policy "closed" (Default): nur verifiziertes "good" führt
+// zu allow. policy "open": zusätzlich "unknown" (Verfügbarkeit). "invalid"
+// (Angriffssignal), "expired" (Zertifikat außerhalb der Gültigkeit) und
+// "unchecked" (nie geprüft) sind in KEINER Politik allow — dafür gibt es
+// keinen Schalter.
+export const DECISION = { good: "allow", revoked: "deny", invalid: "deny", unchecked: "deny", expired: "deny" };
+export function decisionFor(status, policy = "closed") {
+  if (status === "unknown") return policy === "open" ? "allow" : "deny";
+  return DECISION[status] ?? "deny";
+}
+
+// ------------------------------------------------------- Abruf + Prüfung ----
+// status: "good" | "revoked" | "unknown" | "invalid" | "unchecked" | "expired"
+//   unchecked  keine http-Funktion: es wurde nichts geprüft
+//   good       geprüfte, frische CRL, Seriennummer steht nicht darin
+// Zusätzlich in jedem Ergebnis: decision ("allow"/"deny") nach policy —
+// und bei "verified" das geparste CRL-Objekt (Grundlage für den Cache).
+// crlState (optional): schützt vor Wiedergabe alter CRLs.
+export async function fetchAndCheckCrl({ http, url, serial, issuerKey, issuerName, now, subjectIsCA, skewSeconds, requireNextUpdate, crlState, policy = "closed" }) {
+  const finish = (r) => ({ ...r, decision: decisionFor(r.status, policy) });
+  if (typeof http !== "function") return finish({ status: "unchecked", step: "no-http", reason: "keine http-Funktion: Widerruf nicht geprüft" });
+  let sn;
+  try { sn = normalizeSerial(serial); } catch { return finish({ status: "unknown", step: "serial", reason: "ungültige Seriennummer" }); }
+  const r = await http({ method: "GET", url });
+  if (!r?.ok) return finish({ status: "unknown", step: r?.step ?? "network", reason: r?.reason ?? "Abruf fehlgeschlagen" });
+  const v = await verifyCrl(r.body, { issuerKey, issuerName, now, skewSeconds, requireNextUpdate, crlState });
+  if (!v.ok) return finish({ status: v.outcome, step: v.step, reason: v.reason });
+  const { onlyContainsUserCerts: u, onlyContainsCACerts: ca } = v.crl.idp;
+  if ((u || ca) && (subjectIsCA === undefined || (u && subjectIsCA) || (ca && !subjectIsCA))) {
+    return finish({ status: "unknown", step: "scope", reason: "CRL deckt diese Art Zertifikat nicht ab" });
+  }
+  const hit = lookupSerial(v.crl, sn);
+  return hit.revoked
+    ? finish({ status: "revoked", step: "verified", entry: hit.entry, crl_number: v.crl.crlNumber, crl: v.crl })
+    : finish({ status: "good", step: "verified", crl_number: v.crl.crlNumber, crl: v.crl });
+}
+
+// ======================================================= TEIL 2: TRANSPORT ==
+
+const DEFAULTS = {
+  timeoutMs: 8000,          // GESAMTFrist pro Anfrage (über alle Weiterleitungen und den Body)
+  maxBytes: 2 * 1024 * 1024,
+  retries: 1,               // zusätzliche Versuche, nur bei GET/HEAD
+  backoffMs: 250,
+  maxBackoffMs: 5000,
+  minIntervalMs: 250,       // Mindestabstand zwischen Anfragen an denselben Host
+  maxConcurrent: 4,
+  maxRedirects: 3,
+  allowedProtocols: ["https:", "http:"], // CRL/OCSP laufen oft über http
+  blockPrivateHosts: true,
+  retryPost: false,
+};
+
+const refuse = (step, reason, extra = {}) => ({ ok: false, step, reason, ...extra });
+
+export function isBlockedHost(hostname) {
+  let h = hostname.toLowerCase();
+  if (h.startsWith("[")) {
+    const v6 = h.slice(1, -1);
+    return (
+      v6 === "::" || v6 === "::1" ||
+      /^f[cd]/.test(v6) ||            // fc00::/7 unique local
+      /^fe[89ab]/.test(v6) ||         // fe80::/10 link local
+      v6.startsWith("::ffff:") ||     // IPv4-mapped
+      v6.startsWith("64:ff9b:")       // NAT64
+    );
+  }
+  if (h.endsWith(".")) h = h.slice(0, -1);
+  if (/^(?:0+:){5}ffff:/i.test(h)) return true; // IPv4-mapped, expandiert geschrieben
+  if (/^(?:0+:)+1$/i.test(h)) return true;      // ::1, expandiert geschrieben
+  // Hex-IP-Literal wie "0x7f.0.0.1": ALLE Labels numerisch/hex UND mindestens
+  // ein Label in 0x-Notation. Ein Label, das zufällig mit "0x" anfängt (z. B.
+  // "0xford.example.com"), ist ein Name und wird nicht blockiert.
+  const labels = h.split(".");
+  if (
+    labels.some((l) => /^0x[0-9a-f]+$/.test(l)) &&
+    labels.every((l) => /^(0x[0-9a-f]+|\d+)$/.test(l))
+  ) return true;
+  if (/^[0-9.]+$/.test(h)) {
+    // Rein numerisch: nur kanonisches Dotted Quad wird nach Privatheit bewertet.
+    const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+    if (!m) return true; // "127.1", "1.2.3", "2130706433" — nicht kanonisch
+    if (m.slice(1).some((o) => o.length > 1 && o[0] === "0")) return true; // Oktal-Gefahr
+    const [a, b, c] = [+m[1], +m[2], +m[3]];
+    return (
+      a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) || // 192.0.0.0/24 + TEST-NET-1
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) || // Benchmarking + TEST-NET-2
+      (a === 203 && b === 0 && c === 113) // TEST-NET-3
+    );
+  }
+  if (!h.includes(".")) return true; // Einzel-Label: intranet, localhost, ...
+  return /\.(localhost|local|internal|localdomain|lan|home\.arpa)$/.test(h);
+}
+
+export function createHttp(options = {}) {
+  const o = { ...DEFAULTS, ...options };
+  const fetchImpl = o.fetchImpl ?? (typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null);
+  const now = o.now ?? (() => Date.now());
+  const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+  // --- Rate-Limit pro Host: Anfragen werden hintereinander gereiht -----------
+  const lastAt = new Map();
+  const chains = new Map();
+  async function throttle(host) {
+    const prev = chains.get(host) ?? Promise.resolve();
+    let open;
+    const gate = new Promise((r) => (open = r));
+    const tail = prev.then(() => gate);
+    chains.set(host, tail);
+    await prev;
+    try {
+      const wait = (lastAt.get(host) ?? -Infinity) + o.minIntervalMs - now();
+      if (wait > 0) await sleep(wait);
+      lastAt.set(host, now());
+      if (lastAt.size > 1000) {
+        for (const [k, t] of lastAt) if (now() - t > o.minIntervalMs) lastAt.delete(k);
+      }
+    } finally {
+      open();
+      tail.then(() => { if (chains.get(host) === tail) chains.delete(host); });
+    }
+  }
+
+  // --- globale Parallelität ---------------------------------------------------
+  let active = 0;
+  const waiters = [];
+  const acquire = async () => {
+    if (active < o.maxConcurrent) { active++; return; }
+    await new Promise((r) => waiters.push(r)); // Slot wird weitergereicht
+  };
+  const release = () => { const w = waiters.shift(); if (w) w(); else active--; };
+
+  async function readBody(res) {
+    const cl = Number(res.headers.get("content-length"));
+    if (Number.isFinite(cl) && cl > o.maxBytes) return { tooBig: true };
+    if (res.body && typeof res.body.getReader === "function") {
+      const reader = res.body.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > o.maxBytes) { try { await reader.cancel(); } catch {} return { tooBig: true }; }
+        chunks.push(value);
+      }
+      const out = new Uint8Array(total);
+      let p = 0;
+      for (const c of chunks) { out.set(c, p); p += c.length; }
+      return { body: out };
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return buf.length > o.maxBytes ? { tooBig: true } : { body: buf };
+  }
+
+  async function attempt(method, url, headers, body) {
+    let cur = url, curMethod = method, curBody = body, origin0 = null;
+    const deadline = now() + o.timeoutMs; // Gesamtfrist über alle Hops
+    for (let hop = 0; hop <= o.maxRedirects; hop++) {
+      let u;
+      try { u = new URL(cur); } catch { return refuse("url", "ungültige URL"); }
+      if (!o.allowedProtocols.includes(u.protocol)) return refuse("protocol", `Protokoll ${u.protocol} nicht erlaubt`);
+      if (u.username || u.password) return refuse("url", "Zugangsdaten in der URL");
+      if (o.blockPrivateHosts && isBlockedHost(u.hostname)) return refuse("host", "privater oder lokaler Host");
+      origin0 ??= u.origin;
+      // Keine eigenen Header an fremde Origin — und bei Rückkehr zur
+      // Ursprungs-Origin gibt es sie wieder (nicht destruktiv löschen).
+      const hopHeaders = u.origin === origin0 ? headers : {};
+
+      const remaining = deadline - now();
+      if (remaining <= 0) return refuse("timeout", `Frist von ${o.timeoutMs} ms gesamt überschritten`);
+      await acquire();
+      const ctrl = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, remaining);
+      try {
+        await throttle(u.hostname);
+        const res = await fetchImpl(u.href, {
+          method: curMethod, headers: hopHeaders, body: curBody,
+          redirect: "manual", credentials: "omit", cache: "no-store", signal: ctrl.signal,
+        });
+        if (res.type === "opaqueredirect") return refuse("redirect", "Weiterleitung nicht lesbar");
+        if (res.status >= 300 && res.status < 400) {
+          try { await res.body?.cancel(); } catch {} // Antwortkörper freigeben
+          const loc = res.headers.get("location");
+          if (!loc) return refuse("redirect", "Weiterleitung ohne Ziel", { status: res.status });
+          try { cur = new URL(loc, u).href; } catch { return refuse("redirect", "ungültiges Weiterleitungsziel"); }
+          if (res.status === 303 || ((res.status === 301 || res.status === 302) && curMethod === "POST")) {
+            curMethod = "GET"; curBody = undefined;
+          }
+          continue;
+        }
+        const hdrs = {};
+        for (const [k, v] of res.headers) hdrs[k.toLowerCase()] = v;
+        if (res.status < 200 || res.status >= 300) {
+          return refuse("status", `HTTP ${res.status}`, { status: res.status, retry_after: hdrs["retry-after"] });
+        }
+        const r = await readBody(res);
+        if (r.tooBig) return refuse("size", `Antwort größer als ${o.maxBytes} Bytes`, { status: res.status });
+        return { ok: true, status: res.status, headers: hdrs, body: r.body, url: u.href };
+      } catch (e) {
+        return timedOut ? refuse("timeout", `Frist von ${o.timeoutMs} ms gesamt überschritten`) : refuse("network", String(e?.message ?? e));
+      } finally {
+        clearTimeout(timer);
+        release();
+      }
+    }
+    return refuse("redirect", `mehr als ${o.maxRedirects} Weiterleitungen`);
+  }
+
+  const retryable = (r) =>
+    r.step === "network" || r.step === "timeout" || (r.step === "status" && (r.status === 429 || r.status >= 500));
+
+  return async function http(req = {}) {
+    try {
+      if (!fetchImpl) return refuse("network", "kein fetch verfügbar");
+      const method = String(req.method ?? "GET").toUpperCase();
+      const canRetry = method === "GET" || method === "HEAD" || (o.retryPost && method === "POST");
+      const tries = canRetry ? o.retries : 0;
+      let last;
+      for (let i = 0; i <= tries; i++) {
+        last = await attempt(method, req.url, req.headers ?? {}, req.body);
+        if (last.ok || !retryable(last) || i === tries) return last;
+        const ra = Number(last.retry_after);
+        const wait = Number.isFinite(ra) && ra >= 0 ? Math.min(ra * 1000, o.maxBackoffMs) : Math.min(o.backoffMs * 2 ** i, o.maxBackoffMs);
+        await sleep(wait);
+      }
+      return last;
+    } catch (e) {
+      return refuse("network", String(e?.message ?? e));
+    }
+  };
+}
+
+// ====================================================== TEIL 3: VERDRAHTUNG =
+
+// LRU-Cache für verifizierte CRLs. Es wird NUR nach vollständig bestandener
+// Prüfung geschrieben und nur bis zur eigenen Frist der CRL gelesen — der
+// Cache kann nie einen Zustand ausliefern, den die Prüfung nicht freigegeben hat.
+function createCrlCache({ maxEntries = 100 } = {}) {
+  const entries = new Map(); // key → { crl, expiresAt }; Einfüge-Reihenfolge = LRU
+  return {
+    get(key, nowMs) {
+      const e = entries.get(key);
+      if (!e) return null;
+      if (e.expiresAt < nowMs) { entries.delete(key); return null; }
+      entries.delete(key); entries.set(key, e); // LRU auffrischen
+      return e;
+    },
+    set(key, crl, expiresAt) {
+      if (maxEntries <= 0) return;
+      entries.delete(key);
+      entries.set(key, { crl, expiresAt });
+      while (entries.size > maxEntries) entries.delete(entries.keys().next().value);
+    },
+  };
+}
+
+// createCrlChecker(options) → async check({ url, serial, subjectIsCA?, http?, now?, issuerName? })
+//
+//   const check = createCrlChecker({ issuerKey, issuerName, crlState: new Map() });
+//   const r = await check({ url: cert.crlUrl, serial: cert.serialNumber });
+//   // r.status:  "good" | "revoked" | "unknown" | "invalid" | "unchecked"
+//   // r.decision:"allow" | "deny"   — nach policy, Default "closed"
+//   // r.cached:  true, wenn aus dem Cache bedient (kein Netzabruf)
+//
+// issuerName ist im Konstruktor zu binden; für die Zertifikats-Verdrahtung
+// (Teil 5) kann er pro Aufruf überschrieben werden — die CRL muss zum
+// Aussteller des konkreten Zertifikats passen, nicht zu einer globalen Annahme.
+//
+// Eingebaute Entscheidungen: fail-closed als Default (policy "open" als
+// explizites Opt-out) und Cache bis nextUpdate als Default (cache:false zum
+// Abschalten, { maxEntries, ttlMs } zum Begrenzen). Ein Prüfer, ein crlState:
+// der Replay-Schutz lebt in der Closure. http pro Call überschreibbar —
+// Cache-Treffer gelten trotzdem (sie sind bereits geprüft).
+export function createCrlChecker(options = {}) {
+  const {
+    http, issuerKey, issuerName, now, subjectIsCA,
+    skewSeconds = 300, requireNextUpdate, crlState = new Map(),
+    policy = "closed", cache = {}, ...httpOptions
+  } = options;
+  const doFetch = http ?? createHttp(httpOptions);
+  const skew = skewSeconds * 1000;
+  const cacheOpts = cache === true ? {} : cache;
+  const store = cache === false ? null : createCrlCache(cacheOpts);
+
+  return async ({ url, serial, subjectIsCA: perCallCA, http: perCallHttp, now: perCallNow, issuerName: perCallIssuerName } = {}) => {
+    const issuer = perCallIssuerName ?? issuerName;
+    const key = issuer instanceof Uint8Array ? hex(issuer) : "";
+    const at = perCallNow ?? now ?? Date.now();
+    const ca = perCallCA ?? subjectIsCA;
+    const finish = (r) => ({ ...r, decision: decisionFor(r.status, policy) });
+
+    // --- Cache zuerst: verifizierte CRLs bis nextUpdate, ohne Netz ------------
+    let sn = null;
+    try { sn = normalizeSerial(serial); } catch { /* seriöser Fehler unten */ }
+    if (store && sn !== null && key && typeof url === "string") {
+      const hit = store.get(`${key}|${url}`, at);
+      if (hit) {
+        const { onlyContainsUserCerts: u, onlyContainsCACerts: c } = hit.crl.idp;
+        if ((u || c) && (ca === undefined || (u && ca) || (c && !ca))) {
+          return finish({ status: "unknown", step: "scope", reason: "CRL deckt diese Art Zertifikat nicht ab", cached: true });
+        }
+        const entry = hit.crl.revoked.find((e) => e.serial === sn);
+        return finish(entry
+          ? { status: "revoked", step: "verified", cached: true, entry, crl_number: hit.crl.crlNumber }
+          : { status: "good", step: "verified", cached: true, crl_number: hit.crl.crlNumber });
+      }
+    }
+
+    const r = await fetchAndCheckCrl({
+      http: perCallHttp ?? doFetch, url, serial,
+      issuerKey, issuerName: issuer, now: perCallNow ?? now, skewSeconds, requireNextUpdate, crlState,
+      subjectIsCA: ca, policy,
+    });
+
+    // --- Cache füllen: nur verifizierte CRLs, Frist = nextUpdate (- Toleranz) --
+    if (store && r.step === "verified" && r.crl && r.crl.nextUpdate !== null) {
+      const ttl = cacheOpts?.ttlMs ?? Infinity;
+      store.set(`${key}|${url}`, r.crl, Math.min(r.crl.nextUpdate - skew, at + ttl));
+    }
+    return r;
+  };
+}
+
+// ====================================================== TEIL 4: PERSISTENZ ==
+
+// Map, deren set() den Persistenz-Hook triggert. verifyCrl benutzt nur
+// get/set — genau diese Schnittstelle wird gehalten, damit der Store als
+// crlState durchgereicht werden kann, ohne die Prüfung anzufassen.
+class PersistedMap extends Map {
+  #schedule;
+  constructor(schedule) { super(); this.#schedule = schedule; }
+  set(key, value) { const r = super.set(key, value); this.#schedule(); return r; }
+  seed(key, value) { return super.set(key, value); } // Laden ohne Schreib-Auslösung
+}
+
+// createCrlState({ load, save, debounceMs, onError })
+//   load:  async () => Objekt { issuerHex: crlNumberHex } | null (frisch)
+//   save:  async (objekt) => void   — bekommt IMMER den kompletten Stand
+//   debounceMs: Entprellung der Schreibvorgänge (0 = sofort)
+//   onError: Rückruf für fehlgeschlagene Hintergrund-Schreibvorgänge; ohne
+//            ihn wird der Fehler als unbehandelte Ablehnung sichtbar gemacht —
+//            stillschweigender Verlust des Replay-Schutzes ist nicht vorgesehen.
+// Liefert { map, flush }: map als crlState verwenden, flush() vor Prozess-Ende.
+export async function createCrlState({ load, save, debounceMs = 1000, onError } = {}) {
+  const map = new PersistedMap(schedule);
+  let dirty = false, writing = null, timer = null;
+
+  function doSave() {
+    if (!save) return Promise.resolve();
+    dirty = false;
+    writing = Promise.resolve(save(Object.fromEntries(map)))
+      .catch((e) => { dirty = true; throw e; }) // Stand bleibt markiert, flush wiederholt
+      .finally(() => { writing = null; });
+    return writing;
+  }
+
+  function report(e) {
+    if (onError) { onError(e); return; }
+    throw e; // unbehandelte Ablehnung: der Ausfall wird gesehen, nicht verschluckt
+  }
+
+  function schedule() {
+    if (!save) return;
+    dirty = true;
+    clearTimeout(timer);
+    if (debounceMs > 0) timer = setTimeout(() => doSave().catch(report), debounceMs);
+    else doSave().catch(report);
+  }
+
+  if (load) {
+    const data = await load();
+    if (data !== null && data !== undefined) {
+      if (typeof data !== "object") throw new Error("crlState: geladener Zustand ist kein Objekt");
+      for (const [k, v] of Object.entries(data)) {
+        const num = String(v).toLowerCase();
+        if (!/^[0-9a-f]+$/.test(k) || !/^[0-9a-f]+$/.test(num)) {
+          throw new Error(`crlState: beschädigter Eintrag ${JSON.stringify(String(k))}`);
+        }
+        map.seed(k, num);
+      }
+    }
+  }
+
+  async function flush() {
+    clearTimeout(timer);
+    if (writing) { try { await writing; } catch {} }
+    if (dirty) await doSave(); // wirft bei Fehler; dirty bleibt dann gesetzt
+  }
+
+  return { map, flush };
+}
+
+// jsonFileState(path) — Node-Adapter: JSON-Datei als crlState-Speicher.
+// Schreibt atomar über Temp-Datei + Rename; fehlende Datei = frischer Start,
+// beschädigte Datei oder Lesefehler werden weitergeworfen (bewusst laut).
+export async function jsonFileState(path) {
+  let fs;
+  try { fs = await import("node:fs/promises"); }
+  catch { throw new Error("jsonFileState braucht Node (node:fs/promises)"); }
+  return {
+    load: async () => {
+      try { return JSON.parse(await fs.readFile(path, "utf8")); }
+      catch (e) { if (e?.code === "ENOENT") return null; throw e; }
+    },
+    save: async (data) => {
+      const tmp = `${path}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(data), "utf8");
+      await fs.rename(tmp, path);
+    },
+  };
+}
+
+// createPersistentChecker(options) → { check, state }
+//   Wie createCrlChecker, aber der crlState wird aus options.state
+//   ({ load, save, … }) gebaut und hält sich über Neustarts:
+//     const { check, state } = await createPersistentChecker({
+//       issuerKey, issuerName,
+//       state: await jsonFileState("/var/lib/meinservice/crl-state.json"),
+//     });
+//     const r = await check({ url: cert.crlUrl, serial: cert.serialNumber });
+//     // … und vor dem Herunterfahren:  await state.flush();
+//   check() ist identisch zu createCrlChecker — inkl. policy, cache und
+//   http-Override pro Call.
+export async function createPersistentChecker(options = {}) {
+  const { state, ...rest } = options;
+  const store = await createCrlState(state);
+  return {
+    check: createCrlChecker({ ...rest, crlState: store.map }),
+    state: store,
+  };
+}
+
+// ====================================================== TEIL 5: ZERTIFIKAT ==
+
+const OID_CRLDP = "2.5.29.31";
+const OID_AIA = "1.3.6.1.5.5.7.1.1";
+const OID_OCSP_ACCESS = "1.3.6.1.5.5.7.48.1";
+const OID_BASIC_CONSTRAINTS = "2.5.29.19";
+
+// parseCert(der | PEM-CERTIFICATE) →
+//   { serial, issuerDer, notBefore, notAfter, subjectIsCA, crlUrls, ocspUrls }
+//
+// Liest aus dem Zertifikat, was die Widerrufsprüfung braucht. Es wird NICHTS
+// kryptografisch geprüft — das Zertifikat muss bereits kettenvalidiert sein,
+// bevor es hier hineingeht (siehe Kopfkommentar). Unbekannte kritische
+// Erweiterungen des Zertifikats werden hier ignoriert: sie sind Sache der
+// Kettenprüfung, und checkCertificate verlässt sich nicht auf sie.
+export function parseCert(input) {
+  const der = toDer(input);
+  const root = tlv(der, 0);
+  if (root.tag !== 0x30 || root.end !== der.length) fail("parse", "kein Zertifikat");
+  const top = kids(der, root);
+  if (top.length !== 3 || top[0].tag !== 0x30 || top[1].tag !== 0x30 || top[2].tag !== 0x03) {
+    fail("parse", "Certificate hat falsche Gestalt");
+  }
+  const t = kids(der, top[0]);
+  let i = 0;
+  if (t[i]?.tag === 0xa0) i++; // [0] EXPLICIT version
+  const serial = intHex(der, t[i++]);
+  if (!t[i] || t[i].tag !== 0x30) fail("parse", "tbsCertificate unvollständig");
+  i++; // signature AlgorithmIdentifier
+  const issuer = t[i++];
+  if (!issuer || issuer.tag !== 0x30) fail("parse", "kein issuer im Zertifikat");
+  const validity = t[i++];
+  if (!validity || validity.tag !== 0x30) fail("parse", "keine Gültigkeit im Zertifikat");
+  const vk = kids(der, validity);
+  if (vk.length !== 2) fail("parse", "ungültige Gültigkeitsangabe");
+  const notBefore = time(der, vk[0]);
+  const notAfter = time(der, vk[1]);
+  i++; // subject
+  i++; // subjectPublicKeyInfo
+  const crlUrls = [], ocspUrls = [];
+  let subjectIsCA = false;
+  const extsNode = t[t.length - 1];
+  if (extsNode?.tag === 0xa3) {
+    const inner = kids(der, extsNode);
+    if (inner.length !== 1) fail("parse", "mehrfacher [3]-Block im Zertifikat");
+    for (const e of parseExts(der, inner[0])) {
+      if (e.oid === OID_CRLDP) {
+        const seq0 = tlv(e.value, 0);
+        for (const dp of kids(e.value, seq0)) {
+          const dk = kids(der, dp);
+          if (!dk[0] || dk[0].tag !== 0xa0) continue; // DP ohne distributionPoint
+          for (const g of kids(der, kids(der, dk[0])[0])) {
+            if (g.tag === 0x86) crlUrls.push(text(der, g)); // GeneralName URI [6]
+          }
+        }
+      } else if (e.oid === OID_AIA) {
+        const seq0 = tlv(e.value, 0);
+        for (const acc of kids(e.value, seq0)) {
+          const ak = kids(der, acc);
+          if (ak.length === 2 && ak[0].tag === 0x06 && oid(der, ak[0]) === OID_OCSP_ACCESS && ak[1].tag === 0x86) {
+            ocspUrls.push(text(der, ak[1]));
+          }
+        }
+      } else if (e.oid === OID_BASIC_CONSTRAINTS) {
+        const seq0 = tlv(e.value, 0);
+        const bk = kids(der, seq0);
+        subjectIsCA = bk.length && bk[0].tag === 0x01 ? derBool(der, bk[0]) : false; // DEFAULT FALSE
+      }
+    }
+  }
+  return { serial, issuerDer: full(der, issuer), notBefore, notAfter, subjectIsCA, crlUrls, ocspUrls };
+}
+
+// createCertificateChecker(options) → async check({ cert, http?, now?, url? })
+//
+//   const check = createCertificateChecker({ issuerKey, crlState: new Map() });
+//   const r = await check({ cert: certDer });   // oder PEM
+//   // r.decision: "allow" | "deny" — nach policy, Default "closed"
+//   // r.via: "ocsp", wenn eine OCSP-Antwort entschieden hat (ocsp: true)
+//
+// Ablauf: Zertifikat lesen → (optional erwarteten Aussteller gegenprüfen) →
+// Gültigkeitsfenster ("expired" ist immer deny) → mit ocsp:true zuerst die
+// OCSP-URLs aus der AIA (die OCSP-Prüfung wird nur gebaut, wenn kein
+// externer checker übergeben wurde), dann die CRL-Verteilpunkte: issuerName
+// wird automatisch aus dem Zertifikat genommen. Erster "revoked" gewinnt
+// (deny), sonst erstes "good" (allow), sonst "unknown" mit dem letzten Grund.
+// Mit options.checker wird ein bereits konfigurierter CRL-Prüfer
+// (createCrlChecker/createPersistentChecker) wiederverwendet statt gebaut.
+export function createCertificateChecker(options = {}) {
+  const { checker, policy = "closed", issuerName: expectedIssuer, ocsp = false, ...rest } = options;
+  const crlCheck = checker ?? createCrlChecker({ ...rest, policy });
+  const ocspCheck = ocsp && !checker ? createOcspChecker({ ...rest, policy }) : null;
+  return async ({ cert, now: perCallNow, http: perCallHttp, url: urlOverride } = {}) => {
+    const at = perCallNow ?? rest.now ?? Date.now();
+    const finish = (r) => ({ ...r, decision: decisionFor(r.status, policy) });
+    let c;
+    try { c = parseCert(cert); }
+    catch (e) { return finish({ status: "unknown", step: "parse", reason: String(e?.message ?? e) }); }
+    if (expectedIssuer && !(expectedIssuer instanceof Uint8Array && eq(expectedIssuer, c.issuerDer))) {
+      return finish({ status: "unknown", step: "issuer-name", reason: "Zertifikat-Aussteller entspricht nicht der erwarteten CA" });
+    }
+    if (at < c.notBefore || at > c.notAfter) {
+      return finish({
+        status: "expired", step: "validity",
+        reason: at < c.notBefore ? "Zertifikat noch nicht gültig" : "Zertifikat abgelaufen",
+      });
+    }
+    let last = null;
+    if (ocspCheck) {
+      for (const url of c.ocspUrls) {
+        const r = await ocspCheck({ url, serial: c.serial, issuerDer: c.issuerDer, now: perCallNow, http: perCallHttp });
+        if (r.status === "revoked" || r.status === "good") return { ...r, url, via: "ocsp" };
+        last = { ...r, url, via: "ocsp" };
+      }
+    }
+    const urls = urlOverride ? [urlOverride] : c.crlUrls;
+    if (!urls.length) {
+      if (last) return finish({ status: "unknown", step: last.step, reason: last.reason, url: last.url, via: "ocsp" });
+      return finish({ status: "unknown", step: "no-distribution-point", reason: "keine CRL-Verteilpunkt-URL im Zertifikat" });
+    }
+    for (const url of urls) {
+      const r = await crlCheck({
+        url, serial: c.serial, subjectIsCA: c.subjectIsCA,
+        now: perCallNow, http: perCallHttp, issuerName: c.issuerDer,
+      });
+      if (r.status === "revoked" || r.status === "good") return { ...r, url };
+      last = { ...r, url };
+    }
+    return finish({
+      status: "unknown", step: last?.step ?? "network",
+      reason: last?.reason ?? "keine CRL prüfbar", url: last?.url,
+    });
+  };
+}
+
+// =========================================================== TEIL 6: OCSP ===
+
+const OID_OCSP_BASIC = "1.3.6.1.5.5.7.48.1.1";
+const OID_OCSP_NONCE = "1.3.6.1.5.5.7.48.1.5";
+const OID_OCSP_SIGNING_EKU = "1.3.6.1.5.5.7.3.9";
+const OID_EKU = "2.5.29.37";
+const HASH_OIDS = { "SHA-1": "1.3.14.3.2.26", "SHA-256": "2.16.840.1.101.3.4.2.1" };
+
+// ---------------------------------------------------- DER-Encoder (Requests) -
+// Nur für OCSP-Anfragen und CertID nötig — der Parser bleibt wie gehabt streng.
+const catB = (...parts) => {
+  const f = parts.flat(Infinity);
+  const n = f.reduce((a, x) => a + x.length, 0);
+  const o = new Uint8Array(n);
+  let i = 0;
+  for (const x of f) { o.set(x, i); i += x.length; }
+  return o;
+};
+const encT = (tag, ...c) => {
+  const b = catB(...c), l = b.length;
+  const h = l < 128 ? [tag, l] : l < 256 ? [tag, 0x81, l] : [tag, 0x82, l >> 8, l & 255];
+  return catB(Uint8Array.from(h), b);
+};
+const encSeq = (...p) => encT(0x30, ...p);
+const encInt = (h) => {
+  let b = typeof h === "string" ? Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16))) : h;
+  while (b.length > 1 && b[0] === 0) b = b.subarray(1);
+  return encT(0x02, b[0] & 0x80 ? catB(Uint8Array.of(0), b) : b);
+};
+const encOid = (s) => {
+  const a = s.split(".").map(Number);
+  const o = [a[0] * 40 + a[1]];
+  for (const v of a.slice(2)) {
+    const t = [v & 127];
+    let x = v >> 7;
+    while (x) { t.unshift((x & 127) | 128); x >>= 7; }
+    o.push(...t);
+  }
+  return encT(0x06, Uint8Array.from(o));
+};
+const encOct = (b) => encT(0x04, b);
+const encGt = (ms) => {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return encT(0x18, new TextEncoder().encode(
+    `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z`));
+};
+const encExt = (o, critical, val) => encSeq(encOid(o), ...(critical ? [encT(0x01, Uint8Array.of(0xff))] : []), encOct(val));
+
+const sha = async (alg, data) => new Uint8Array(await subtle().digest(alg, data));
+
+// subjectPublicKey-Bits eines SPKI (Inhalt des BIT STRING ohne Unused-Byte) —
+// Basis für issuerKeyHash und responderID byKey.
+export function spkiPublicKeyBits(spki) {
+  const root = tlv(spki, 0);
+  if (root.tag !== 0x30 || root.end !== spki.length) fail("key", "kein gültiges SubjectPublicKeyInfo");
+  const k = kids(spki, root);
+  if (k.length !== 2 || k[1].tag !== 0x03) fail("key", "kein Public-Key-Bitstring im SPKI");
+  return bitString(spki, k[1]);
+}
+
+// RFC 6960 CertID: Hash über Aussteller-Name (DER) und Aussteller-Schlüssel
+// (SPKI-Bits) plus Seriennummer. Default SHA-1 — der De-facto-Standard der
+// Responder; "SHA-256" ist als Option möglich (Parameter-freie AlgorithmID).
+export async function buildCertId({ issuerDer, issuerKey, serial, hashAlg = "SHA-1" }) {
+  if (!(issuerDer instanceof Uint8Array)) fail("parse", "kein issuer-DER übergeben");
+  if (!(issuerKey instanceof Uint8Array)) fail("parse", "kein Ausstellerschlüssel übergeben");
+  const hashOid = HASH_OIDS[hashAlg] ?? fail("parse", `CertID-Hash ${hashAlg} wird nicht unterstützt`);
+  const sn = normalizeSerial(serial);
+  const [nameHash, keyHash] = await Promise.all([
+    sha(hashAlg, issuerDer),
+    sha(hashAlg, spkiPublicKeyBits(issuerKey)),
+  ]);
+  return encSeq(encSeq(
+    encSeq(encOid(hashOid)),
+    encOct(nameHash),
+    encOct(keyHash),
+    encInt(sn),
+  ));
+}
+
+// OCSP-Anfrage: unsigned (Standard bei Respondern), mit Nonce als
+// Anforderungs-Erweiterung — die Antwort MUSS sie zurückgeben.
+export async function createOcspRequest({ issuerDer, issuerKey, serial, nonce, hashAlg = "SHA-1" }) {
+  const certId = await buildCertId({ issuerDer, issuerKey, serial, hashAlg });
+  const requestList = encSeq(encSeq(certId));
+  const tbsRequest = nonce
+    ? encSeq(requestList, encT(0xa1, encSeq(encExt(OID_OCSP_NONCE, false, encOct(nonce)))))
+    : encSeq(requestList);
+  return encSeq(tbsRequest);
+}
+
+// Responder-Zertifikat (in der Antwort [0]) begutachten: von der CA signiert,
+// OCSP-Signing-EKU, zum responderID passend, gültig. Es wird NICHT auf Widerruf
+// geprüft (id-pkix-ocsp-nocheck-Konvention, siehe Kopfkommentar).
+async function inspectResponderCert(buf, certNode, { issuerKey, responder, now, hashAlg }) {
+  const top = kids(buf, certNode);
+  if (top.length !== 3 || top[0].tag !== 0x30) fail("parse", "Responder-Zertifikat fehlerhaft");
+  const [tbsN, algN, sigN] = top;
+  const tk = kids(buf, tbsN);
+  let i = 0;
+  if (tk[i]?.tag === 0xa0) i++;
+  intHex(buf, tk[i++]); // Serial (Form-Check)
+  const algN2 = tk[i++];
+  const subject = tk[i++];
+  const validity = tk[i++];
+  const spkiNode = tk[i++];
+  if (!subject || subject.tag !== 0x30 || !validity || validity.tag !== 0x30 || !spkiNode || spkiNode.tag !== 0x30) {
+    fail("parse", "Responder-Zertifikat unvollständig");
+  }
+  const spki = full(buf, spkiNode);
+  const bits = spkiPublicKeyBits(spki);
+  const rk = kids(buf, responder);
+  const byName = responder.tag === 0xa1 && rk.length === 1 && eq(full(buf, rk[0]), full(buf, subject));
+  const byKey = responder.tag === 0xa2 && rk.length === 1 && eq(body(buf, rk[0]), await sha(hashAlg, bits));
+  if (!byName && !byKey) return null;
+  const vk = kids(buf, validity);
+  if (vk.length !== 2) fail("parse", "Responder-Zertifikat: ungültige Gültigkeit");
+  const nB = time(buf, vk[0]), nA = time(buf, vk[1]);
+  if (now < nB || now > nA) fail("responder", "Responder-Zertifikat außerhalb der Gültigkeit");
+  let hasOcspEku = false;
+  const extsNode = tk[tk.length - 1];
+  if (extsNode?.tag === 0xa3) {
+    const inner = kids(buf, extsNode);
+    if (inner.length === 1) {
+      for (const e of parseExts(buf, inner[0])) {
+        if (e.oid !== OID_EKU) continue;
+        const seq0 = tlv(e.value, 0);
+        for (const u of kids(e.value, seq0)) {
+          if (u.tag === 0x06 && oid(e.value, u) === OID_OCSP_SIGNING_EKU) hasOcspEku = true;
+        }
+      }
+    }
+  }
+  if (!hasOcspEku) return null; // kein delegierter OCSP-Responder
+  // Vom Aussteller signiert? Fehlschlag ist ein Tampering-Signal (invalid).
+  await verifyWithSpki(full(buf, tbsN), oid(buf, kids(buf, algN2)[0]), bitString(buf, sigN), issuerKey);
+  return { spki };
+}
+
+// verifyOcsp(input, opts) → { ok, outcome, step, reason?, ocsp? }
+//   opts: { issuerKey (SPKI der CA), issuerDer, serial, nonce?, now?,
+//           skewSeconds?, requireNextUpdate?, hashAlg? }
+//   Reihenfolge: parse → responder → signature → nonce → cert-id → freshness
+//   → status. outcome wie bei verifyCrl: "invalid" nur beiSignatur-Versagen.
+export async function verifyOcsp(input, opts = {}) {
+  const {
+    issuerKey, issuerDer, serial, nonce,
+    now = Date.now(), skewSeconds = 300, requireNextUpdate = true, hashAlg = "SHA-1",
+  } = opts;
+  try {
+    const der = toDer(input);
+    const root = tlv(der, 0);
+    if (root.tag !== 0x30 || root.end !== der.length) fail("parse", "keine OCSPResponse");
+    const top = kids(der, root);
+    if (!top.length || top[0].tag !== 0x0a) fail("parse", "OCSPResponse ohne ResponseStatus");
+    const respStatus = der[top[0].start];
+    const STATUS_NAMES = ["successful", "malformedRequest", "internalError", "tryLater", "unused", "signatureRequired", "unauthorized"];
+    if (respStatus !== 0) fail("responder", `OCSP-Status: ${STATUS_NAMES[respStatus] ?? respStatus}`);
+    if (top.length !== 2 || top[1].tag !== 0x30) fail("parse", "keine ResponseBytes");
+    const rb = kids(der, top[1]);
+    if (rb.length !== 2 || rb[0].tag !== 0x06 || oid(der, rb[0]) !== OID_OCSP_BASIC || rb[1].tag !== 0x04) {
+      fail("responder", "nur id-pkix-ocsp-basic wird unterstützt");
+    }
+    const basicDer = body(der, rb[1]);
+    const basic = tlv(basicDer, 0);
+    if (basic.tag !== 0x30 || basic.end !== basicDer.length) fail("parse", "kein BasicOCSPResponse");
+    const bk = kids(basicDer, basic);
+    if (bk.length < 3 || bk.length > 4) fail("parse", "BasicOCSPResponse hat falsche Gestalt");
+    const [tbsN, algN, sigN, certsN] = bk;
+    if (sigN.tag !== 0x03) fail("parse", "keine Signatur im BasicOCSPResponse");
+
+    // --- Responder: CA selbst oder delegiertes, CA-signiertes Zertifikat -----
+    const tk = kids(basicDer, tbsN);
+    let ri = 0;
+    if (tk[0]?.tag === 0xa0) ri++; // [0] version
+    const responder = tk[ri++];
+    if (!responder || (responder.tag !== 0xa1 && responder.tag !== 0xa2)) fail("parse", "kein responderID");
+    const producedAt = time(basicDer, tk[ri++]);
+    const responses = tk[ri++];
+    if (!responses || responses.tag !== 0x30) fail("parse", "keine responses");
+    const rExts = tk[ri++];
+    if (rExts && rExts.tag !== 0xa1) fail("parse", "unerwartetes Feld in tbsResponseData");
+
+    const keyBits = spkiPublicKeyBits(issuerKey);
+    let verifySpki = null;
+    const rk = kids(basicDer, responder);
+    if (rk.length !== 1) fail("parse", "responderID ohne Inhalt");
+    const byName = responder.tag === 0xa1 && eq(full(basicDer, rk[0]), issuerDer);
+    const byKey = responder.tag === 0xa2 && rk[0].tag === 0x04 && eq(body(basicDer, rk[0]), await sha(hashAlg, keyBits));
+    if (byName || byKey) {
+      verifySpki = issuerKey; // die CA hat selbst signiert
+    } else {
+      if (!certsN || certsN.tag !== 0xa0) fail("responder", "Antwort stammt nicht von der CA und ohne Responder-Zertifikat");
+      const certList = kids(basicDer, kids(basicDer, certsN)[0]);
+      for (const certNode of certList) {
+        const found = await inspectResponderCert(basicDer, certNode, { issuerKey, responder, now, hashAlg });
+        if (found) { verifySpki = found.spki; break; }
+      }
+      if (!verifySpki) fail("responder", "kein passendes, CA-signiertes OCSP-Responder-Zertifikat in der Antwort");
+    }
+
+    // --- Signatur über tbsResponseData --------------------------------------
+    await verifyWithSpki(full(basicDer, tbsN), oid(basicDer, kids(basicDer, algN)[0]), bitString(basicDer, sigN), verifySpki);
+
+    // --- Nonce: angefragt heißt zurückgegeben --------------------------------
+    if (nonce) {
+      let nonceSeen = null;
+      if (rExts) {
+        const inner = kids(basicDer, rExts);
+        if (inner.length !== 1) fail("parse", "mehrfacher [1]-Block in tbsResponseData");
+        for (const e of parseExts(basicDer, inner[0])) {
+          if (e.oid === OID_OCSP_NONCE) {
+            const n = tlv(e.value, 0);
+            if (n.tag !== 0x04) fail("parse", "Nonce-Erweiterung ohne OCTET STRING");
+            nonceSeen = body(e.value, n);
+          } else if (e.critical) {
+            fail("critical-extension", `unbekannte kritische Antwort-Erweiterung ${e.oid}`);
+          }
+        }
+      }
+      if (!nonceSeen) fail("nonce", "Responder hat die angefragte Nonce nicht zurückgegeben");
+      if (!eq(nonceSeen, nonce)) fail("nonce", "Nonce passt nicht zur Anfrage");
+    } else if (rExts) {
+      const inner = kids(basicDer, rExts);
+      if (inner.length === 1) {
+        for (const e of parseExts(basicDer, inner[0])) {
+          if (e.critical) fail("critical-extension", `unbekannte kritische Antwort-Erweiterung ${e.oid}`);
+        }
+      }
+    }
+
+    // --- CertID: byte-exakter Abgleich (inkl. Hash-Algorithmus) --------------
+    const expectedCertId = await buildCertId({ issuerDer, issuerKey, serial, hashAlg });
+    let single = null;
+    for (const sr of kids(basicDer, responses)) {
+      const sk = kids(basicDer, sr);
+      if (sk.length && eq(full(basicDer, sk[0]), expectedCertId)) { single = sr; break; }
+    }
+    if (!single) fail("cert-id", "Antwort enthält keinen Eintrag für dieses Zertifikat");
+    const sk = kids(basicDer, single);
+    if (sk.length < 3 || sk.length > 5) fail("parse", "SingleResponse hat falsche Gestalt");
+
+    // --- Status --------------------------------------------------------------
+    const statusNode = sk[1];
+    let certStatus = "unknown", revocationTime = null, revocationReason = null;
+    if (statusNode.tag === 0x80) certStatus = "good";          // [0] IMPLICIT NULL
+    else if (statusNode.tag === 0xa1) {                         // [1] IMPLICIT RevokedInfo
+      certStatus = "revoked";
+      const rv = kids(basicDer, statusNode);
+      if (!rv.length) fail("parse", "RevokedInfo ohne Widerrufszeit");
+      revocationTime = time(basicDer, rv[0]);
+      if (rv[1]?.tag === 0xa0) {
+        const wrapC = kids(basicDer, rv[1])[0];
+        const rr = tlv(basicDer, wrapC);
+        if (rr.tag !== 0x0a) fail("parse", "Widerrufsgrund erwartet ENUMERATED");
+        revocationReason = basicDer[rr.start];
+      }
+    } else if (statusNode.tag !== 0x82) fail("parse", "unbekannter certStatus-Tag");
+
+    // --- Frist ---------------------------------------------------------------
+    const thisUpdate = time(basicDer, sk[2]);
+    let nextUpdate = null;
+    for (let j = 3; j < sk.length; j++) {
+      if (sk[j].tag === 0x17 || sk[j].tag === 0x18) nextUpdate = time(basicDer, sk[j]);
+      else if (sk[j].tag === 0xa0) {
+        const inner = kids(basicDer, sk[j]);
+        if (inner.length !== 1) fail("parse", "mehrfacher [0]-Block in SingleResponse");
+        for (const e of parseExts(basicDer, inner[0])) {
+          if (e.critical) fail("critical-extension", `unbekannte kritische Eintrags-Erweiterung ${e.oid}`);
+        }
+      } else fail("parse", "unerwartetes Feld in SingleResponse");
+    }
+    const skew = skewSeconds * 1000;
+    if (producedAt > now + skew) fail("freshness", "producedAt liegt in der Zukunft");
+    if (thisUpdate > now + skew) fail("freshness", "thisUpdate liegt in der Zukunft");
+    if (nextUpdate === null) { if (requireNextUpdate) fail("freshness", "nextUpdate fehlt"); }
+    else if (nextUpdate < now - skew) fail("freshness", "OCSP-Antwort ist abgelaufen");
+
+    return {
+      ok: true, outcome: "verified", step: "verified",
+      ocsp: { certStatus, revocationTime, revocationReason, thisUpdate, nextUpdate, producedAt },
+    };
+  } catch (e) {
+    if (e instanceof Refusal) return { ok: false, outcome: outcomeOf(e.step), step: e.step, reason: e.message };
+    return { ok: false, outcome: "unknown", step: "internal", reason: String(e?.message ?? e) };
+  }
+}
+
+// createOcspChecker(options) → async check({ url, serial, issuerDer, http?, now? })
+//
+//   const check = createOcspChecker({ issuerKey, policy: "closed" });
+//   const r = await check({ url: cert.ocspUrl, serial, issuerDer });
+//   // r.status:  "good" | "revoked" | "unknown" | "invalid"
+//   // r.decision:"allow" | "deny"
+//
+// POST application/ocsp-request mit frischer Nonce pro Aufruf (nonceBytes: 0
+// schaltet sie ab — für Responder ohne Nonce-Support, auf eigene Gefahr).
+// POST wird standardmäßig nicht wiederholt (retryPost bleibt aus).
+export function createOcspChecker(options = {}) {
+  const {
+    http, issuerKey, now, skewSeconds = 300, requireNextUpdate = true,
+    policy = "closed", nonceBytes = 16, hashAlg = "SHA-1", ...httpOptions
+  } = options;
+  const doFetch = http ?? createHttp(httpOptions);
+  return async ({ url, serial, issuerDer, now: perCallNow, http: perCallHttp } = {}) => {
+    const finish = (r) => ({ ...r, decision: decisionFor(r.status, policy) });
+    if (!(issuerKey instanceof Uint8Array)) return finish({ status: "unknown", step: "key", reason: "kein Ausstellerschlüssel (SPKI) übergeben" });
+    if (!(issuerDer instanceof Uint8Array)) return finish({ status: "unknown", step: "issuer-name", reason: "kein issuer-DER übergeben" });
+    let sn;
+    try { sn = normalizeSerial(serial); } catch { return finish({ status: "unknown", step: "serial", reason: "ungültige Seriennummer" }); }
+    const nonce = nonceBytes > 0 ? globalThis.crypto.getRandomValues(new Uint8Array(nonceBytes)) : null;
+    const req = await createOcspRequest({ issuerDer, issuerKey, serial: sn, nonce, hashAlg });
+    const res = await (perCallHttp ?? doFetch)({
+      method: "POST", url,
+      headers: { "content-type": "application/ocsp-request", accept: "application/ocsp-response" },
+      body: req,
+    });
+    if (!res?.ok) return finish({ status: "unknown", step: res?.step ?? "network", reason: res?.reason ?? "Abruf fehlgeschlagen" });
+    const v = await verifyOcsp(res.body, { issuerKey, issuerDer, serial: sn, nonce, now: perCallNow ?? now, skewSeconds, requireNextUpdate, hashAlg });
+    if (!v.ok) return finish({ status: v.outcome, step: v.step, reason: v.reason });
+    const o = v.ocsp;
+    if (o.certStatus === "good") {
+      return finish({ status: "good", step: "verified", produced_at: o.producedAt, this_update: o.thisUpdate, next_update: o.nextUpdate });
+    }
+    if (o.certStatus === "revoked") {
+      return finish({ status: "revoked", step: "verified", entry: { date: o.revocationTime, reason: o.revocationReason } });
+    }
+    return finish({ status: "unknown", step: "ocsp-unknown", reason: "Responder kennt das Zertifikat nicht" });
+  };
+}
